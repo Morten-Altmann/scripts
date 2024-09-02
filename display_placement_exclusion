@@ -1,0 +1,167 @@
+// Configuration settings
+var SETTINGS = {
+  // Placeholder for partial campaign name; for multiple words, use the pipe '|' character. Example: 'display|discovery|demand'
+  campaignNameContains: 'display',  
+  whitelistExtensions: ['.dk', '.com'],  // Domain extensions to whitelist
+  neverExcludeDomains: ['bt.dk', 'tv2.dk', 'ekstrabladet.dk', 'jv.dk', 'fyens.dk'], // Domains never to exclude
+  enablePerformanceCheck: true,  // Control for performance check
+  nonWhitelistedMaxConversions: 0, // Maximum conversions to not consider exclusion if under this threshold
+  performanceThresholds: {
+    minClicks: 200,  // Minimum clicks required to consider exclusion
+    maxConversions: 0  // Maximum conversions to consider exclusion if the click threshold is met
+  },
+  dateRange: 360  // Number of days to look back
+};
+
+function main() {
+  var totalExcludedClicks = 0; // Variable to sum up total clicks for excluded sites
+  var totalExcludedCost = 0; // Variable to sum up the total cost for excluded sites
+  var totalExcludedDomains = 0; // Variable to count the number of excluded domains
+  
+  var campaigns = AdsApp.campaigns()
+    .withCondition('Name CONTAINS_IGNORE_CASE "' + SETTINGS.campaignNameContains + '"')
+    .withCondition('Status = ENABLED')
+    .get();
+  
+  // Log the number of campaigns found
+  Logger.log('Number of Active Campaigns Found: ' + campaigns.totalNumEntities());
+
+  while (campaigns.hasNext()) {
+    var campaign = campaigns.next();
+    Logger.log('Processing Active Campaign: ' + campaign.getName());
+    let processedDomains = new Set(); // To keep track of processed domains for uniqueness
+    let excludedDomains = getAlreadyExcludedDomains(campaign); // Retrieve already excluded domains for this campaign
+    
+    // Get the results from part_1
+    let result1 = part_1(campaign, processedDomains, excludedDomains);
+    totalExcludedClicks += result1.totalExcludedClicks;
+    totalExcludedCost += result1.totalExcludedCost;
+    totalExcludedDomains += result1.totalExcludedDomains;
+
+    // If performance check is enabled, run part_2
+    if (SETTINGS.enablePerformanceCheck) {
+      let result2 = part_2(campaign, result1.whitelistedPlacements, processedDomains, excludedDomains);
+      totalExcludedClicks += result2.totalExcludedClicks;
+      totalExcludedCost += result2.totalExcludedCost;
+      totalExcludedDomains += result2.totalExcludedDomains;
+    }
+  }
+
+  // Log the total number of clicks, cost, and domains that went to the excluded sites
+  Logger.log('Total Clicks to Excluded Sites: ' + totalExcludedClicks);
+  Logger.log('Total Cost for Excluded Sites: ' + totalExcludedCost.toFixed(2));
+  Logger.log('Total Number of Excluded Domains: ' + totalExcludedDomains);
+}
+
+function getAlreadyExcludedDomains(campaign) {
+  var excludedDomains = new Set();
+  var excludedPlacements = campaign.display().excludedPlacements().get();
+  while (excludedPlacements.hasNext()) {
+    var excludedPlacement = excludedPlacements.next();
+    excludedDomains.add(excludedPlacement.getUrl());
+  }
+  return excludedDomains;
+}
+
+function part_1(campaign, processedDomains, excludedDomains) {
+  Logger.log("Running Part 1: Excluding non-whitelisted placements based on conversion criteria.");
+  var startDate = Utilities.formatDate(new Date(new Date().setDate(new Date().getDate() - SETTINGS.dateRange)), AdsApp.currentAccount().getTimeZone(), "yyyy-MM-dd");
+  var endDate = Utilities.formatDate(new Date(), AdsApp.currentAccount().getTimeZone(), "yyyy-MM-dd");
+  var query = `
+    SELECT 
+      campaign.name,
+      group_placement_view.display_name,
+      group_placement_view.placement_type,
+      metrics.clicks,
+      metrics.conversions,
+      metrics.cost_micros
+    FROM group_placement_view
+    WHERE campaign.name = '${campaign.getName()}'
+      AND campaign.status = 'ENABLED'
+      AND group_placement_view.placement_type = 'WEBSITE'
+      AND segments.date BETWEEN '${startDate}' AND '${endDate}'`;
+
+  var placements = AdsApp.search(query);
+  var whitelistedPlacements = [];
+
+  // Initialize counts for part 1
+  var totalExcludedClicks = 0;
+  var totalExcludedCost = 0;
+  var totalExcludedDomains = 0;
+
+  while (placements.hasNext()) {
+    var placementRow = placements.next();
+    var displayName = placementRow.groupPlacementView ? placementRow.groupPlacementView.displayName : 'Unnamed';
+    var clicks = parseInt(placementRow.metrics.clicks, 10);
+    var conversions = parseInt(placementRow.metrics.conversions, 10);
+    var cost = parseInt(placementRow.metrics.costMicros, 10) / 1e6; // Convert cost from micros to standard currency (e.g., USD)
+
+    if (!displayName || displayName === 'Unnamed' || SETTINGS.neverExcludeDomains.includes(displayName) || processedDomains.has(displayName) || excludedDomains.has(displayName)) {
+      continue;
+    }
+
+    if (conversions <= SETTINGS.nonWhitelistedMaxConversions && !isWhitelistedDomain(displayName) && !processedDomains.has(displayName)) {
+      excludePlacement(campaign, displayName);
+      Logger.log(`Excluded non-whitelisted Placement - Campaign: ${campaign.getName()}, Domain: ${displayName}, Clicks: ${clicks}, Conversions: ${conversions}, Cost: ${cost.toFixed(2)}`);
+      totalExcludedClicks += clicks; // Add clicks to total
+      totalExcludedCost += cost; // Add cost to total
+      totalExcludedDomains++; // Increment the number of excluded domains
+      processedDomains.add(displayName); // Mark this domain as processed
+      excludedDomains.add(displayName); // Add to excluded set
+    } else {
+      whitelistedPlacements.push(placementRow);
+    }
+  }
+
+  return {
+    totalExcludedClicks: totalExcludedClicks,
+    totalExcludedCost: totalExcludedCost,
+    totalExcludedDomains: totalExcludedDomains,
+    whitelistedPlacements: whitelistedPlacements
+  };
+}
+
+function part_2(campaign, whitelistedPlacements, processedDomains, excludedDomains) {
+  Logger.log("Running Part 2: Evaluating performance of whitelisted placements.");
+
+  // Initialize counts for part 2
+  var totalExcludedClicks = 0;
+  var totalExcludedCost = 0;
+  var totalExcludedDomains = 0;
+
+  whitelistedPlacements.forEach(placementRow => {
+    var displayName = placementRow.groupPlacementView.displayName;
+    var clicks = parseInt(placementRow.metrics.clicks, 10);
+    var conversions = parseInt(placementRow.metrics.conversions, 10);
+    var cost = parseInt(placementRow.metrics.costMicros, 10) / 1e6; // Convert cost from micros to standard currency
+
+    if (clicks >= SETTINGS.performanceThresholds.minClicks && conversions <= SETTINGS.performanceThresholds.maxConversions && !processedDomains.has(displayName) && !excludedDomains.has(displayName)) {
+      excludePlacement(campaign, displayName);
+      Logger.log(`Excluded underperforming whitelisted Placement - Campaign: ${campaign.getName()}, Domain: ${displayName}, Clicks: ${clicks}, Conversions: ${conversions}, Cost: ${cost.toFixed(2)}`);
+      totalExcludedClicks += clicks; // Add clicks to total
+      totalExcludedCost += cost; // Add cost to total
+      totalExcludedDomains++; // Increment the number of excluded domains
+      processedDomains.add(displayName); // Maintain uniqueness
+      excludedDomains.add(displayName); // Add to excluded set
+    }
+  });
+
+  return {
+    totalExcludedClicks: totalExcludedClicks,
+    totalExcludedCost: totalExcludedCost,
+    totalExcludedDomains: totalExcludedDomains
+  };
+}
+
+function excludePlacement(campaign, placementUrl) {
+  try {
+    var exclusion = campaign.display().newPlacementBuilder().withUrl(placementUrl).exclude();
+    Logger.log("Excluded -- " + placementUrl + " from " + campaign.getName());
+  } catch (e) {
+    Logger.log("Could not exclude " + placementUrl + " due to error: " + e.message);
+  }
+}
+
+function isWhitelistedDomain(domain) {
+  return SETTINGS.whitelistExtensions.some(ext => domain.endsWith(ext));
+}
